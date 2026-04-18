@@ -10,12 +10,19 @@ Sprite assets by webfussel — https://webfussel.itch.io/more-bit-8-bit-mario
 """
 import tkinter as tk
 import random
-import ctypes
-import ctypes.wintypes as wt
 import math
 import threading
 import sys
 import os
+import platform
+
+_IS_WIN = sys.platform == 'win32'
+_IS_MAC = sys.platform == 'darwin'
+_IS_LINUX = sys.platform.startswith('linux')
+
+if _IS_WIN:
+    import ctypes
+    import ctypes.wintypes as wt
 
 try:
     from PIL import Image as PILImage, ImageTk
@@ -1689,28 +1696,42 @@ class Game:
 
 
 # ============================================================
-#  GLOBAL HOTKEY (Ctrl+Alt+M) using Windows RegisterHotKey
+#  GLOBAL HOTKEY  (platform-aware)
 # ============================================================
-HOTKEY_ID = 1
-MOD_CTRL_ALT = 0x0001 | 0x0002  # MOD_ALT | MOD_CONTROL
+if _IS_WIN:
+    HOTKEY_ID = 1
+    MOD_CTRL_ALT = 0x0001 | 0x0002  # MOD_ALT | MOD_CONTROL
 
 def _hotkey_listener(callback):
-    """Run in a thread – blocks on GetMessage, fires callback on hotkey."""
-    user32 = ctypes.windll.user32
-    # Unregister any stale hotkey from a previous crashed instance
-    user32.UnregisterHotKey(None, HOTKEY_ID)
-    if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_CTRL_ALT, 0x4D):  # 0x4D = 'M'
-        print("Ctrl+Alt+M taken, trying Ctrl+Alt+Shift+M...")
-        MOD_FALLBACK = 0x0001 | 0x0002 | 0x0004  # ALT | CONTROL | SHIFT
-        if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_FALLBACK, 0x4D):
-            print("Could not register hotkey. Kill other instances first.")
+    """Run in a thread – blocks until hotkey pressed, fires callback."""
+    if _IS_WIN:
+        user32 = ctypes.windll.user32
+        user32.UnregisterHotKey(None, HOTKEY_ID)
+        if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_CTRL_ALT, 0x4D):
+            print("Ctrl+Alt+M taken, trying Ctrl+Alt+Shift+M...")
+            MOD_FALLBACK = 0x0001 | 0x0002 | 0x0004
+            if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_FALLBACK, 0x4D):
+                print("Could not register hotkey. Kill other instances first.")
+                return
+            print("Registered: Ctrl+Alt+Shift+M")
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == 0x0312:
+                callback()
+        user32.UnregisterHotKey(None, HOTKEY_ID)
+    else:
+        # Linux / macOS: use pynput if available, otherwise skip
+        try:
+            from pynput import keyboard
+        except ImportError:
+            print("pynput not installed – global hotkey disabled.")
+            print("Install with: pip install pynput")
+            print("Use ESC to hide, or the system tray icon.")
             return
-        print("Registered: Ctrl+Alt+Shift+M")
-    msg = wt.MSG()
-    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-        if msg.message == 0x0312:  # WM_HOTKEY
-            callback()
-    user32.UnregisterHotKey(None, HOTKEY_ID)
+        hotkey_str = '<ctrl>+<alt>+m'
+        print(f"Registered: Ctrl+Alt+M (pynput)")
+        with keyboard.GlobalHotKeys({hotkey_str: callback}) as h:
+            h.join()
 
 
 # ============================================================
@@ -1788,17 +1809,29 @@ class App:
             self.root.after_idle(self.root.destroy)
 
     def run(self):
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except Exception:
-            pass
+        if _IS_WIN:
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                pass
 
         self.root = tk.Tk()
         root = self.root
         root.attributes("-fullscreen", True)
         root.overrideredirect(True)
         root.wm_attributes("-topmost", True)
-        root.wm_attributes("-transparentcolor", "black")
+
+        # Platform-specific transparency
+        if _IS_WIN:
+            root.wm_attributes("-transparentcolor", "black")
+        elif _IS_LINUX:
+            # Needs a compositing WM (Picom, Mutter, KWin, etc.)
+            try:
+                root.wait_visibility(root)
+                root.wm_attributes("-alpha", 0.95)
+            except Exception:
+                pass
+
         root.update_idletasks()
 
         W = root.winfo_screenwidth()
@@ -1844,14 +1877,34 @@ class App:
 
 
 if __name__ == "__main__":
-    # Single-instance mutex – prevent multiple overlays
-    _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "DesktopMario_SingleInstance")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        print("Desktop Mario is already running. Exiting.")
-        ctypes.windll.kernel32.CloseHandle(_mutex)
-        sys.exit(0)
+    # Single-instance guard (platform-aware)
+    _lock_handle = None
+    _lock_file = None
+    if _IS_WIN:
+        _lock_handle = ctypes.windll.kernel32.CreateMutexW(None, True, "DesktopMario_SingleInstance")
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            print("Desktop Mario is already running. Exiting.")
+            ctypes.windll.kernel32.CloseHandle(_lock_handle)
+            sys.exit(0)
+    else:
+        # Linux / macOS: use a lock file
+        import fcntl
+        _lock_path = os.path.join(os.environ.get('XDG_RUNTIME_DIR',
+                                  os.environ.get('TMPDIR', '/tmp')),
+                                  'desktop_mario.lock')
+        try:
+            _lock_file = open(_lock_path, 'w')
+            fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (IOError, OSError):
+            print("Desktop Mario is already running. Exiting.")
+            sys.exit(0)
     try:
         App().run()
     finally:
-        ctypes.windll.kernel32.ReleaseMutex(_mutex)
-        ctypes.windll.kernel32.CloseHandle(_mutex)
+        if _IS_WIN and _lock_handle:
+            ctypes.windll.kernel32.ReleaseMutex(_lock_handle)
+            ctypes.windll.kernel32.CloseHandle(_lock_handle)
+        elif _lock_file:
+            import fcntl
+            fcntl.flock(_lock_file, fcntl.LOCK_UN)
+            _lock_file.close()
