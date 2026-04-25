@@ -20,8 +20,9 @@ _IS_WIN = sys.platform == 'win32'
 _IS_MAC = sys.platform == 'darwin'
 _IS_LINUX = sys.platform.startswith('linux')
 
+# ctypes is available on all platforms; wintypes is Windows-only
+import ctypes
 if _IS_WIN:
-    import ctypes
     import ctypes.wintypes as wt
 
 try:
@@ -937,9 +938,11 @@ class Game:
             fill='#FFFFFF', font=('Courier', 12, 'bold'), anchor='n')
 
         # ---- DONATE BUTTON (top-right) ----
+        # macOS: emoji glyphs in tkinter canvas crash CoreGraphics on macOS 26+
+        _donate_label = "Donate" if _IS_MAC else "☕ Donate"
         self.donate_btn = canvas.create_text(
             W - 20, 18,
-            text="☕ Donate",
+            text=_donate_label,
             fill='#FFD700', font=('Courier', 13, 'bold'), anchor='ne')
         canvas.tag_bind(self.donate_btn, '<Button-1>', lambda e: _open_donate())
         canvas.tag_bind(self.donate_btn, '<Enter>',
@@ -1719,8 +1722,57 @@ def _hotkey_listener(callback):
             if msg.message == 0x0312:
                 callback()
         user32.UnregisterHotKey(None, HOTKEY_ID)
+    elif _IS_MAC:
+        # macOS: Quartz CGEventTap (needs Accessibility permission in System Settings)
+        # Falls back to pynput if pyobjc-framework-Quartz is not installed.
+        try:
+            import Quartz as _Q
+            _M = 46  # virtual key-code for 'm' on macOS QWERTY
+            _MODS = (_Q.kCGEventFlagMaskControl | _Q.kCGEventFlagMaskAlternate)
+
+            def _tap_cb(_proxy, _etype, _ev, _ref):
+                if _etype == _Q.kCGEventKeyDown:
+                    kc = _Q.CGEventGetIntegerValueField(_ev, _Q.kCGKeyboardEventKeycode)
+                    fl = _Q.CGEventGetFlags(_ev)
+                    if kc == _M and (fl & _MODS) == _MODS:
+                        callback()
+                return _ev
+
+            _opt = getattr(_Q, 'kCGEventTapOptionListenOnly', 1)
+            _tap = _Q.CGEventTapCreate(
+                _Q.kCGSessionEventTap,
+                _Q.kCGHeadInsertEventTap,
+                _opt,
+                _Q.CGEventMaskBit(_Q.kCGEventKeyDown),
+                _tap_cb,
+                None,
+            )
+            if _tap is None:
+                print(
+                    "Ctrl+Option+M hotkey unavailable.\n"
+                    "Grant Accessibility access: System Settings → "
+                    "Privacy & Security → Accessibility → add your terminal."
+                )
+                return
+            _src = _Q.CFMachPortCreateRunLoopSource(None, _tap, 0)
+            _loop = _Q.CFRunLoopGetCurrent()
+            _Q.CFRunLoopAddSource(_loop, _src, _Q.kCFRunLoopDefaultMode)
+            _Q.CGEventTapEnable(_tap, True)
+            print("Registered: Ctrl+Option+M (Quartz)")
+            _Q.CFRunLoopRun()  # blocks daemon thread until app exits
+        except ImportError:
+            # Quartz not available – fall back to pynput
+            try:
+                from pynput import keyboard
+                print("Registered: Ctrl+Alt+M (pynput – macOS fallback)")
+                with keyboard.GlobalHotKeys({'<ctrl>+<alt>+m': callback}) as h:
+                    h.join()
+            except ImportError:
+                print("No global hotkey available on macOS.")
+                print("Install pyobjc-framework-Quartz (recommended) or pynput.")
+                print("Use the Dock icon, ESC, or right-click to show/hide.")
     else:
-        # Linux / macOS: use pynput if available, otherwise skip
+        # Linux: use pynput GlobalHotKeys
         try:
             from pynput import keyboard
         except ImportError:
@@ -1728,9 +1780,8 @@ def _hotkey_listener(callback):
             print("Install with: pip install pynput")
             print("Use ESC to hide, or the system tray icon.")
             return
-        hotkey_str = '<ctrl>+<alt>+m'
-        print(f"Registered: Ctrl+Alt+M (pynput)")
-        with keyboard.GlobalHotKeys({hotkey_str: callback}) as h:
+        print("Registered: Ctrl+Alt+M (pynput)")
+        with keyboard.GlobalHotKeys({'<ctrl>+<alt>+m': callback}) as h:
             h.join()
 
 
@@ -1800,6 +1851,14 @@ class App:
         else:
             self.root.deiconify()
             self.root.focus_force()
+            if _IS_MAC:
+                # overrideredirect windows need explicit app activation on
+                # macOS to receive keyboard events after deiconify.
+                try:
+                    from AppKit import NSApp
+                    NSApp.activateIgnoringOtherApps_(True)
+                except ImportError:
+                    pass
             self.visible = True
 
     def quit_app(self):
@@ -1817,25 +1876,88 @@ class App:
 
         self.root = tk.Tk()
         root = self.root
-        root.attributes("-fullscreen", True)
         root.overrideredirect(True)
         root.wm_attributes("-topmost", True)
 
-        # Platform-specific transparency
         if _IS_WIN:
+            # Windows: borderless fullscreen with colour-keyed transparency.
+            root.attributes("-fullscreen", True)
             root.wm_attributes("-transparentcolor", "black")
-        elif _IS_LINUX:
-            # Needs a compositing WM (Picom, Mutter, KWin, etc.)
+            root.update_idletasks()
+            W = root.winfo_screenwidth()
+            H = root.winfo_screenheight()
+
+        elif _IS_MAC:
+            # macOS: overrideredirect borderless window.
+            # Solid black canvas – systemTransparent causes sprite trails on
+            # dirty-region repaints; black correctly erases old sprite positions.
+            #
+            # Patch canBecomeKeyWindow so the window receives keyboard events.
+            try:
+                _lo = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+                _lo.objc_lookUpClass.restype = ctypes.c_void_p
+                _lo.objc_lookUpClass.argtypes = [ctypes.c_char_p]
+                _lo.sel_registerName.restype = ctypes.c_void_p
+                _lo.sel_registerName.argtypes = [ctypes.c_char_p]
+                _lo.class_replaceMethod.restype = ctypes.c_void_p
+                _lo.class_replaceMethod.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_char_p,
+                ]
+                _imp = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+                @_imp
+                def _ckw(_s, _c):
+                    return True
+
+                _lo.class_replaceMethod(
+                    _lo.objc_lookUpClass(b"TKWindow"),
+                    _lo.sel_registerName(b"canBecomeKeyWindow"),
+                    _ckw,
+                    b"c@:",
+                )
+            except Exception:
+                pass
+
+            # Use visibleFrame to avoid covering the Dock and menu bar.
+            try:
+                from AppKit import NSScreen
+                _screen = NSScreen.mainScreen()
+                _full_h = _screen.frame().size.height
+                _vis = _screen.visibleFrame()
+                _x = int(_vis.origin.x)
+                # Cocoa origin is bottom-left; convert to Tk top-left.
+                _y = int(_full_h - _vis.origin.y - _vis.size.height)
+                root.geometry(
+                    f"{int(_vis.size.width)}x{int(_vis.size.height)}"
+                    f"+{_x}+{_y}"
+                )
+            except ImportError:
+                root.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
+
+            root.update_idletasks()
+            W = root.winfo_width()
+            H = root.winfo_height()
+
+            # Show app in Dock so user can click to show/hide.
+            try:
+                from AppKit import NSApp
+                NSApp.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular
+            except ImportError:
+                pass
+            root.createcommand('::tk::mac::ReopenApplication', self._toggle_impl)
+            root.createcommand('::tk::mac::Quit', self.quit_app)
+
+        else:  # Linux
+            # Needs a compositing WM (Picom, Mutter, KWin, etc.) for transparency.
             try:
                 root.wait_visibility(root)
                 root.wm_attributes("-alpha", 0.95)
             except Exception:
                 pass
-
-        root.update_idletasks()
-
-        W = root.winfo_screenwidth()
-        H = root.winfo_screenheight()
+            root.update_idletasks()
+            W = root.winfo_screenwidth()
+            H = root.winfo_screenheight()
 
         canvas = tk.Canvas(root, width=W, height=H, bg='black', highlightthickness=0)
         canvas.pack()
@@ -1845,7 +1967,7 @@ class App:
 
         self.game = Game(canvas, W, H)
 
-        # start hidden – press Ctrl+Alt+M to show
+        # start hidden – press hotkey or click Dock icon to show
         root.withdraw()
         self.visible = False
 
@@ -1858,13 +1980,35 @@ class App:
         t = threading.Thread(target=_hotkey_listener, args=(self.toggle,), daemon=True)
         t.start()
 
-        # start system tray icon
-        tray_t = threading.Thread(
-            target=_create_tray_icon,
-            args=(self.toggle, self.quit_app),
-            daemon=True
-        )
-        tray_t.start()
+        # System tray / context menu
+        if _IS_WIN or _IS_LINUX:
+            # Windows: pystray system tray icon
+            # Linux: pystray runs if GTK is available, silently skips otherwise
+            tray_t = threading.Thread(
+                target=_create_tray_icon,
+                args=(self.toggle, self.quit_app),
+                daemon=True
+            )
+            tray_t.start()
+        else:
+            # macOS: pystray's AppKit backend conflicts with Aqua Tk (crashes).
+            # Use a right-click context menu on the canvas instead.
+            ctx = tk.Menu(root, tearoff=0)
+            ctx.add_command(label="Hide (ESC / Dock icon)", command=self._toggle_impl)
+            ctx.add_separator()
+            ctx.add_command(label="Donate (PayPal)", command=_open_donate)
+            ctx.add_separator()
+            ctx.add_command(label="Quit Desktop Mario", command=self.quit_app)
+
+            def _show_ctx(event):
+                try:
+                    ctx.tk_popup(event.x_root, event.y_root)
+                finally:
+                    ctx.grab_release()
+
+            # Button-2 = two-finger tap / right-click on macOS trackpads
+            canvas.bind("<Button-2>", _show_ctx)
+            canvas.bind("<Button-3>", _show_ctx)
 
         def animate():
             if self._quitting:
@@ -1887,15 +2031,13 @@ if __name__ == "__main__":
             ctypes.windll.kernel32.CloseHandle(_lock_handle)
             sys.exit(0)
     else:
-        # Linux / macOS: use a lock file
-        import fcntl
-        _lock_path = os.path.join(os.environ.get('XDG_RUNTIME_DIR',
-                                  os.environ.get('TMPDIR', '/tmp')),
-                                  'desktop_mario.lock')
+        # Linux / macOS: UDP socket lock – auto-released on exit or crash.
+        # AF_UNIX abstract sockets are Linux-only; AF_INET works on both.
+        import socket as _socket
+        _lock_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         try:
-            _lock_file = open(_lock_path, 'w')
-            fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (IOError, OSError):
+            _lock_sock.bind(('127.0.0.1', 47299))
+        except OSError:
             print("Desktop Mario is already running. Exiting.")
             sys.exit(0)
     try:
@@ -1904,7 +2046,5 @@ if __name__ == "__main__":
         if _IS_WIN and _lock_handle:
             ctypes.windll.kernel32.ReleaseMutex(_lock_handle)
             ctypes.windll.kernel32.CloseHandle(_lock_handle)
-        elif _lock_file:
-            import fcntl
-            fcntl.flock(_lock_file, fcntl.LOCK_UN)
-            _lock_file.close()
+        elif not _IS_WIN:
+            _lock_sock.close()
