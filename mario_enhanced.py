@@ -823,8 +823,15 @@ class Game:
                 _sm_photos.append(_pil_to_photoimage(_load_png_sprite(fn, S, S)))
             for fn in ['small_0.png', 'small_2.png', 'small_3.png', 'small_5.png']:
                 _sm_photos.append(_pil_to_photoimage(_load_png_sprite(fn, S, S, flip_h=True)))
+            # Extra frames at indices 16-19: skid-R, skid-L, crouch-R, crouch-L
+            _sm_extra = []
+            for fn, flip in [('small_4.png', False), ('small_4.png', True),
+                              ('small_6.png', False), ('small_6.png', True)]:
+                img = _load_png_sprite(fn, S, S, flip_h=flip)
+                _sm_extra.append(_pil_to_photoimage(img) if img else _sm_photos[4 if flip else 0])
         else:
             _sm_photos = None
+            _sm_extra = None
 
         if _big_png:
             _bg_photos = []
@@ -832,32 +839,54 @@ class Game:
                 _bg_photos.append(_pil_to_photoimage(_load_png_sprite(fn, S, BIG_H)))
             for fn in ['big_0.png', 'big_2.png', 'big_3.png', 'big_5.png']:
                 _bg_photos.append(_pil_to_photoimage(_load_png_sprite(fn, S, BIG_H, flip_h=True)))
+            # Extra frames at indices 20-23: big skid-R, skid-L, crouch-R, crouch-L
+            _bg_extra = []
+            for fn, flip in [('big_4.png', False), ('big_4.png', True),
+                              ('big_6.png', False), ('big_6.png', True)]:
+                img = _load_png_sprite(fn, S, BIG_H, flip_h=flip)
+                _bg_extra.append(_pil_to_photoimage(img) if img else _bg_photos[4 if flip else 0])
         else:
             _bg_photos = None
+            _bg_extra = None
 
-        # Single sprite with 16 frames: 0-7 = small, 8-15 = big
+        # Sprite frame layout (24 frames total):
+        #  0-7  = small (stand, run1, run2, jump × R+L)
+        #  8-15 = big   (stand, run1, run2, jump × R+L)
+        # 16-19 = small extras (skid-R, skid-L, crouch-R, crouch-L)
+        # 20-23 = big extras   (skid-R, skid-L, crouch-R, crouch-L)
+        _fb_sm_extra = [
+            _frame_to_photo(MARIO_STAND, PX), _frame_to_photo(MARIO_STAND_L, PX),
+            _frame_to_photo(MARIO_STAND, PX), _frame_to_photo(MARIO_STAND_L, PX),
+        ]
+        _fb_bg_extra = [
+            _frame_to_photo(BIG_MARIO_STAND, PX), _frame_to_photo(BIG_MARIO_STAND_L, PX),
+            _frame_to_photo(BIG_MARIO_STAND, PX), _frame_to_photo(BIG_MARIO_STAND_L, PX),
+        ]
         if _sm_photos and _bg_photos:
-            self.mario = Sprite(canvas, [], photos=_sm_photos + _bg_photos)
+            self.mario = Sprite(canvas, [], photos=_sm_photos + _bg_photos + _sm_extra + _bg_extra)
         elif _sm_photos:
             big_frames = [
                 BIG_MARIO_STAND, BIG_MARIO_RUN1, BIG_MARIO_RUN2, BIG_MARIO_JUMP,
                 BIG_MARIO_STAND_L, BIG_MARIO_RUN1_L, BIG_MARIO_RUN2_L, BIG_MARIO_JUMP_L,
             ]
             big_built = [_frame_to_photo(f, PX) for f in big_frames]
-            self.mario = Sprite(canvas, [], photos=_sm_photos + big_built)
+            self.mario = Sprite(canvas, [], photos=_sm_photos + big_built + _sm_extra + _fb_bg_extra)
         elif _bg_photos:
             small_frames = [
                 MARIO_STAND, MARIO_RUN1, MARIO_RUN2, MARIO_JUMP,
                 MARIO_STAND_L, MARIO_RUN1_L, MARIO_RUN2_L, MARIO_JUMP_L,
             ]
             small_built = [_frame_to_photo(f, PX) for f in small_frames]
-            self.mario = Sprite(canvas, [], photos=small_built + _bg_photos)
+            self.mario = Sprite(canvas, [], photos=small_built + _bg_photos + _fb_sm_extra + _bg_extra)
         else:
             all_frames = [
                 MARIO_STAND, MARIO_RUN1, MARIO_RUN2, MARIO_JUMP,
                 MARIO_STAND_L, MARIO_RUN1_L, MARIO_RUN2_L, MARIO_JUMP_L,
                 BIG_MARIO_STAND, BIG_MARIO_RUN1, BIG_MARIO_RUN2, BIG_MARIO_JUMP,
                 BIG_MARIO_STAND_L, BIG_MARIO_RUN1_L, BIG_MARIO_RUN2_L, BIG_MARIO_JUMP_L,
+                # extras: skid/crouch fallback to stand
+                MARIO_STAND, MARIO_STAND_L, MARIO_STAND, MARIO_STAND_L,
+                BIG_MARIO_STAND, BIG_MARIO_STAND_L, BIG_MARIO_STAND, BIG_MARIO_STAND_L,
             ]
             self.mario = Sprite(canvas, all_frames)
 
@@ -884,6 +913,8 @@ class Game:
 
         self.is_big = False        # mushroom power-up state
         self.shrink_timer = 0      # invincibility after getting hit while big
+        self.crouching = False     # Down arrow held on ground
+        self.skidding  = False     # fast direction reversal on ground
         self.mwx = 200.0          # world-x
         self.my  = self.ground_y  # screen-y (top of sprite)
         self.mvx = 0.0
@@ -1183,7 +1214,9 @@ class Game:
         self.tick += 1
         B = self.BLK
         S = self.SPR
-        MH = (32 * PX) if self.is_big else S   # Mario hitbox height
+        # Crouching: big Mario hitbox collapses to small height
+        self.crouching = 'Down' in self.keys and self.on_ground
+        MH = S if (self.is_big and self.crouching) else ((32 * PX) if self.is_big else S)
         MT = self.my - (MH - S) if self.is_big else self.my  # Mario hitbox top
 
         # ---- invincibility / grace countdowns ----
@@ -1208,24 +1241,41 @@ class Game:
         max_speed = 8.0 if running else 5.0
         friction = 0.6
 
-        if 'Right' in self.keys:
-            self.mvx = min(self.mvx + accel, max_speed)
-            self.facing_right = True
-        elif 'Left' in self.keys:
-            self.mvx = max(self.mvx - accel, -max_speed)
-            self.facing_right = False
-        else:
-            # friction
-            if abs(self.mvx) < friction:
+        if self.crouching:
+            # Crouching: no horizontal input, extra friction to stop quickly
+            if abs(self.mvx) < 1.5:
                 self.mvx = 0
             elif self.mvx > 0:
-                self.mvx -= friction
+                self.mvx -= 1.5
             else:
-                self.mvx += friction
+                self.mvx += 1.5
+            self.skidding = False
+        else:
+            # Skid: pressing opposite direction while moving fast on ground
+            self.skidding = (
+                self.on_ground and abs(self.mvx) > 2.5 and
+                (('Right' in self.keys and self.mvx < 0) or
+                 ('Left' in self.keys and self.mvx > 0))
+            )
+            if 'Right' in self.keys:
+                self.mvx = min(self.mvx + accel, max_speed)
+                self.facing_right = True
+            elif 'Left' in self.keys:
+                self.mvx = max(self.mvx - accel, -max_speed)
+                self.facing_right = False
+            else:
+                self.skidding = False
+                # friction
+                if abs(self.mvx) < friction:
+                    self.mvx = 0
+                elif self.mvx > 0:
+                    self.mvx -= friction
+                else:
+                    self.mvx += friction
 
         # Variable-height jump (from original SMB JumpSwimTimer mechanic:
         # holding jump applies reduced gravity while ascending)
-        if 'space' in self.keys and self.on_ground:
+        if 'space' in self.keys and self.on_ground and not self.crouching:
             self.mvy = -16
             self.on_ground = False
             self.jumping = True
@@ -1280,9 +1330,11 @@ class Game:
                 elif self.mvy < 0:
                     self.my = sy + sh + (MH - S) if self.is_big else sy + sh
                     self.mvy = 1
-                    # bump ?-blocks
+                    # bump ?-blocks: check all qblocks at the same row independently
+                    # so an adjacent brick collision doesn't prevent the reward
                     for q in self.qblocks:
-                        if not q['hit'] and q['wx'] == sx and q['y'] == sy:
+                        if not q['hit'] and q['y'] == sy and \
+                                self._overlap(self.mwx, sy, S, sh, q['wx'], q['y'], B, B):
                             q['hit'] = True
                             q['s'].draw(1)
                             scr_x = q['wx'] - self.cam
@@ -1333,13 +1385,19 @@ class Game:
         # ---- draw Mario (small or big, direction-aware, blink) ----
         msx = self.mwx - self.cam
         face_off = 0 if self.facing_right else 4
-        # Single sprite: frames 0-7 = small, 8-15 = big
+        # Frame layout: 0-7=small, 8-15=big, 16-19=sm extras, 20-23=bg extras
         big_off = 8 if self.is_big else 0
+        sz_off  = 4 if self.is_big else 0   # offset into the extra-frame block
+        lr_off  = 0 if self.facing_right else 1
         if self.is_big:
             draw_y = self.my - (32 * PX - S)  # align feet for big sprite
         else:
             draw_y = self.my
-        if not self.on_ground:
+        if self.crouching and self.on_ground:
+            self.mario.draw(18 + lr_off + sz_off)   # crouch-R/L, small(18-19)/big(22-23)
+        elif self.skidding:
+            self.mario.draw(16 + lr_off + sz_off)   # skid-R/L,   small(16-17)/big(20-21)
+        elif not self.on_ground:
             self.mario.draw(big_off + 3 + face_off)
         elif abs(self.mvx) > 0.5:
             self.mario.draw(big_off + 1 + (self.tick // 4 % 2) + face_off)
@@ -1881,11 +1939,13 @@ class App:
 
         if _IS_WIN:
             # Windows: borderless fullscreen with colour-keyed transparency.
-            root.attributes("-fullscreen", True)
-            root.wm_attributes("-transparentcolor", "black")
+            # Note: -fullscreen is incompatible with overrideredirect in Tk 8.6.13+
+            # so we set geometry manually instead.
             root.update_idletasks()
             W = root.winfo_screenwidth()
             H = root.winfo_screenheight()
+            root.geometry(f"{W}x{H}+0+0")
+            root.wm_attributes("-transparentcolor", "black")
 
         elif _IS_MAC:
             # macOS: overrideredirect borderless window.
